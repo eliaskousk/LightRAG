@@ -161,6 +161,7 @@ def create_app(args):
         "openai",
         "azure_openai",
         "aws_bedrock",
+        "google",
     ]:
         raise Exception("llm binding not supported")
 
@@ -171,6 +172,7 @@ def create_app(args):
         "azure_openai",
         "aws_bedrock",
         "jina",
+        "google",
     ]:
         raise Exception("embedding binding not supported")
 
@@ -460,6 +462,17 @@ def create_app(args):
                     return await jina_embed(
                         texts, dimensions=dimensions, base_url=host, api_key=api_key
                     )
+                else binding == "google":
+                	from lightrag.llm.google import google_complete, google_embed
+        			from lightrag.utils import GemmaTokenizer
+					return google_embed(
+						texts,
+					    model=args.embedding_model,
+					    api_key=args.embedding_binding_api_key,
+					    project_id=args.embedding_binding_project_id,
+					    location=args.embedding_binding_location,
+					 )
+        			
                 else:  # openai and compatible
                     from lightrag.llm.openai import openai_embed
 
