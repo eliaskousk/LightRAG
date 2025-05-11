@@ -308,6 +308,7 @@ def create_app(args):
         "azure_openai",
         "aws_bedrock",
         "gemini",
+        "google",
     ]:
         raise Exception("llm binding not supported")
 
@@ -319,6 +320,7 @@ def create_app(args):
         "aws_bedrock",
         "jina",
         "gemini",
+        "google",
     ]:
         raise Exception("embedding binding not supported")
 
