@@ -362,6 +362,7 @@ LightRAG supports binding to various LLM/Embedding backends:
 * ollama
 * openai (including openai compatible)
 * azure_openai
+* google
 * lollms
 * aws_bedrock
 
