@@ -308,6 +308,7 @@ def create_app(args):
         "azure_openai",
         "aws_bedrock",
         "gemini",
+        "google",
     ]:
         raise Exception("llm binding not supported")
 
@@ -319,6 +320,7 @@ def create_app(args):
         "aws_bedrock",
         "jina",
         "gemini",
+        "google",
     ]:
         raise Exception("embedding binding not supported")
 
@@ -809,6 +811,17 @@ def create_app(args):
                         embedding_dim=embedding_dim,
                         task_type=gemini_options.get("task_type", "RETRIEVAL_DOCUMENT"),
                     )
+                else binding == "google":
+                	from lightrag.llm.google import google_complete, google_embed
+        			from lightrag.utils import GemmaTokenizer
+					return google_embed(
+						texts,
+					    model=args.embedding_model,
+					    api_key=args.embedding_binding_api_key,
+					    project_id=args.embedding_binding_project_id,
+					    location=args.embedding_binding_location,
+					 )
+        			
                 else:  # openai and compatible
                     from lightrag.llm.openai import openai_embed
 
