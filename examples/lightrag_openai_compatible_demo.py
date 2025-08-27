@@ -4,8 +4,7 @@ import inspect
 import logging
 import logging.config
 from lightrag import LightRAG, QueryParam
-from lightrag.llm.openai import openai_complete_if_cache
-from lightrag.llm.ollama import ollama_embed
+from lightrag.llm.openai import openai_embed, openai_complete_if_cache
 from lightrag.utils import EmbeddingFunc, logger, set_verbose_debug
 from lightrag.kg.shared_storage import initialize_pipeline_status
 
@@ -112,10 +111,11 @@ async def initialize_rag():
         embedding_func=EmbeddingFunc(
             embedding_dim=int(os.getenv("EMBEDDING_DIM", "1024")),
             max_token_size=int(os.getenv("MAX_EMBED_TOKENS", "8192")),
-            func=lambda texts: ollama_embed(
+            func=lambda texts: openai_embed(
                 texts,
-                embed_model=os.getenv("EMBEDDING_MODEL", "bge-m3:latest"),
-                host=os.getenv("EMBEDDING_BINDING_HOST", "http://localhost:11434"),
+                model=os.getenv("EMBEDDING_MODEL", "bge-m3:latest"),
+                api_key=os.getenv("EMBEDDING_BINDING_API_KEY") or os.getenv("OPENAI_API_KEY"),
+                base_url=os.getenv("EMBEDDING_BINDING_HOST", "http://localhost:11434"),
             ),
         ),
     )
