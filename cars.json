@@ -1,0 +1,20 @@
+[
+  {
+    "make": "Toyota",
+    "model": "Camry",
+    "year": 2023,
+    "description": "The Toyota Camry is a reliable and fuel-efficient mid-size sedan, known for its comfortable ride and strong resale value."
+  },
+  {
+    "make": "Honda",
+    "model": "Civic",
+    "year": 2023,
+    "description": "The Honda Civic is a compact car that offers a sporty driving experience, excellent fuel economy, and a high-quality interior."
+  },
+  {
+    "make": "Ford",
+    "model": "Mustang",
+    "year": 2024,
+    "description": "The Ford Mustang is an iconic American muscle car that delivers powerful performance and head-turning style."
+  }
+]
