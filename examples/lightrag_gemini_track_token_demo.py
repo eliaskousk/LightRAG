@@ -20,7 +20,7 @@ setup_logger("lightrag", level="DEBUG")
 nest_asyncio.apply()
 
 load_dotenv()
-gemini_api_key = os.getenv("GEMINI_API_KEY")
+
 siliconflow_api_key = os.getenv("SILICONFLOW_API_KEY")
 
 WORKING_DIR = "./dickens"
@@ -35,7 +35,7 @@ async def llm_model_func(
     prompt, system_prompt=None, history_messages=[], keyword_extraction=False, **kwargs
 ) -> str:
     # 1. Initialize the GenAI Client with your Gemini API Key
-    client = genai.Client(api_key=gemini_api_key)
+    client = genai.Client(vertexai=True)
 
     # 2. Combine prompts: system prompt, history, and user prompt
     if history_messages is None:
@@ -54,7 +54,7 @@ async def llm_model_func(
 
     # 3. Call the Gemini model
     response = client.models.generate_content(
-        model="gemini-2.0-flash",
+        model="gemini-2.5-flash",
         contents=[combined_prompt],
         config=types.GenerateContentConfig(
             max_output_tokens=5000, temperature=0, top_k=10
