@@ -3,6 +3,7 @@
 import os
 from typing import Optional
 import asyncio
+import shutil
 import logging
 import logging.config
 from lightrag import LightRAG, QueryParam
@@ -15,10 +16,10 @@ from dotenv import load_dotenv
 load_dotenv()
 GOOGLE_GEMINI_MODEL = os.environ.get("LLM_MODEL")
 if GOOGLE_GEMINI_MODEL is None:
-    os.environ["LLM_MODEL"] = "gemini-2.0-flash-001"
+    os.environ["LLM_MODEL"] = "gemini-2.5-flash-lite"
 
 os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = os.environ.get(
-    "GOOGLE_GENAI_USE_VERTEXAI", True
+    "GOOGLE_GENAI_USE_VERTEXAI", "true"
 )
 os.environ["GOOGLE_CLOUD_PROJECT"] = os.environ.get(
     "GOOGLE_CLOUD_PROJECT", "your-project-id"
@@ -31,7 +32,7 @@ os.environ["GOOGLE_CLOUD_LOCATION"] = os.environ.get(
 
 GOOGLE_EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL")
 if GOOGLE_EMBEDDING_MODEL is None:
-    os.environ["EMBEDDING_MODEL"] = "text-embedding-004"
+    os.environ["EMBEDDING_MODEL"] = "gemini-embedding-001"
 
 WORKING_DIR = "./dickens"
 
@@ -101,6 +102,8 @@ def configure_logging():
 
 if not os.path.exists(WORKING_DIR):
     os.mkdir(WORKING_DIR)
+else:
+    shutil.rmtree(WORKING_DIR)
 
 
 async def initialize_rag(task_type: Optional[str] = None) -> LightRAG:
@@ -125,6 +128,7 @@ async def initialize_rag(task_type: Optional[str] = None) -> LightRAG:
 
 
 async def main():
+    rag = None
     try:
         # Initialize RAG instance for inserting data
         rag = await initialize_rag(task_type="RETRIEVAL_DOCUMENT")
