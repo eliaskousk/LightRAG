@@ -1,6 +1,7 @@
 import sys
 import os
 import logging
+import hashlib
 import numpy as np
 from typing import Any, Union, Optional, List, Dict
 
@@ -14,6 +15,8 @@ import pipmaster as pm
 # Install specific modules if not already present
 if not pm.is_installed("google-genai"):
     pm.install("google-genai")
+if not pm.is_installed("google-api-core"):
+    pm.install("google-api-core")
 if not pm.is_installed("numpy"):
     pm.install("numpy")  # numpy is used for embeddings
 if not pm.is_installed("tenacity"):
@@ -71,11 +74,59 @@ RETRYABLE_GOOGLE_EXCEPTIONS = (
 )
 
 
-DEFAULT_GOOGLE_GEMINI_MODEL = "gemini-2.0-flash"  # Default model for Gemini API
-# Default embedding model parameters (for text-embedding-005)
-DEFAULT_GOOGLE_EMBEDDING_MODEL = "text-embedding-005"
-DEFAULT_GOOGLE_EMBEDDING_DIM = 768
-DEFAULT_GOOGLE_MAX_TOKEN_SIZE = 8192  # Max tokens per individual text for this model
+DEFAULT_GOOGLE_GEMINI_MODEL = "gemini-2.5-flash-lite"
+DEFAULT_GOOGLE_EMBEDDING_MODEL = "gemini-embedding-001"
+DEFAULT_GOOGLE_EMBEDDING_DIM = 3072
+DEFAULT_GOOGLE_MAX_TOKEN_SIZE = 8192
+
+# Global client cache
+_client_cache: Dict[str, GoogleGenAIClient] = {}
+
+
+def clear_client_cache() -> None:
+    """
+    Clear the global client cache.
+    Useful for testing or when configuration changes.
+    """
+    global _client_cache
+    _client_cache.clear()
+    logger.info("Google GenAI client cache cleared")
+
+
+def _get_client_cache_key(
+    api_key: Optional[str] = None,
+    project_id: Optional[str] = None,
+    location: Optional[str] = None,
+    use_vertex_ai: Optional[bool] = None,
+) -> str:
+    """
+    Generate a cache key for the client based on connection parameters.
+    """
+    # Determine effective values
+    effective_api_key = (
+        api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    )
+    effective_project_id = project_id or os.environ.get("GOOGLE_CLOUD_PROJECT")
+    effective_location = location or os.environ.get("GOOGLE_CLOUD_LOCATION")
+    
+    # Determine use_vertex_ai
+    effective_use_vertex_ai = use_vertex_ai
+    if effective_use_vertex_ai is None:
+        if effective_project_id:
+            effective_use_vertex_ai = True
+        elif effective_api_key:
+            effective_use_vertex_ai = False
+        else:
+            effective_use_vertex_ai = False
+    
+    # Create cache key
+    if effective_use_vertex_ai:
+        return f"vertex_{effective_project_id}_{effective_location}"
+    else:
+        # Hash the API key for security (don't store plain API keys as cache keys)
+        import hashlib
+        key_hash = hashlib.sha256(effective_api_key.encode()).hexdigest()[:16] if effective_api_key else "no_key"
+        return f"gemini_{key_hash}"
 
 
 async def create_google_async_client(
@@ -84,11 +135,19 @@ async def create_google_async_client(
     location: Optional[str] = None,
     use_vertex_ai: Optional[bool] = None,
     client_configs: Optional[Dict[str, Any]] = None,
+    use_cache: bool = True,
 ) -> GoogleGenAIClient:
     """
     Creates an asynchronous Google Generative AI client.
     Prioritizes explicit params, then environment variables.
+    Uses a cache to avoid recreating clients with the same configuration.
     """
+    # Check cache first if enabled
+    if use_cache:
+        cache_key = _get_client_cache_key(api_key, project_id, location, use_vertex_ai)
+        if cache_key in _client_cache:
+            logger.debug(f"Using cached Google GenAI client (cache_key: {cache_key})")
+            return _client_cache[cache_key]
     effective_use_vertex_ai = use_vertex_ai
 
     # Determine API key
@@ -143,7 +202,15 @@ async def create_google_async_client(
         }
 
         final_vertex_args.update(merged_client_args)
-        return GoogleGenAIClient(**final_vertex_args)
+        client = GoogleGenAIClient(**final_vertex_args)
+        
+        # Cache the client if caching is enabled
+        if use_cache:
+            cache_key = _get_client_cache_key(api_key, project_id, location, use_vertex_ai)
+            _client_cache[cache_key] = client
+            logger.debug(f"Cached new Vertex AI client (cache_key: {cache_key})")
+        
+        return client
     else:
         logger.info("Initializing Google GenAI Client for Gemini API (API Key).")
         if not effective_api_key:
@@ -153,7 +220,15 @@ async def create_google_async_client(
 
         final_gemini_args = {"api_key": effective_api_key}
         final_gemini_args.update(merged_client_args)
-        return GoogleGenAIClient(**final_gemini_args)
+        client = GoogleGenAIClient(**final_gemini_args)
+        
+        # Cache the client if caching is enabled
+        if use_cache:
+            cache_key = _get_client_cache_key(api_key, project_id, location, use_vertex_ai)
+            _client_cache[cache_key] = client
+            logger.debug(f"Cached new Gemini API client (cache_key: {cache_key})")
+        
+        return client
 
 
 @retry(
@@ -184,6 +259,7 @@ async def google_complete_if_cache(
         )  # Reduce verbosity of underlying SDK
 
     client_call_configs = kwargs.pop("google_client_configs", {})  # For client creation
+    use_cache = kwargs.pop("use_client_cache", True)  # Allow disabling cache if needed
 
     google_client = await create_google_async_client(
         api_key=api_key,
@@ -191,6 +267,7 @@ async def google_complete_if_cache(
         location=location,
         use_vertex_ai=use_vertex_ai,
         client_configs=client_call_configs,
+        use_cache=use_cache,
     )
 
     # Prepare contents for API call
@@ -200,7 +277,7 @@ async def google_complete_if_cache(
             role = msg.get("role", "user").lower()
             # Google SDK expects "user" or "model"
             if role not in ["user", "model"]:
-                logger.warning(
+                logger.debug(
                     f"Invalid role '{role}' in history_messages, mapping to 'user'. Supported: 'user', 'model'."
                 )
                 role = "user" if role != "assistant" else "model"  # common mapping
@@ -492,7 +569,7 @@ async def google_complete(
 
 
 # --- Specific Model Wrappers (Examples) ---
-async def gemini_2_0_flash_complete(
+async def gemini_2_5_flash_lite_complete(
     prompt: str,
     system_prompt: Optional[str] = None,
     history_messages: Optional[List[dict]] = None,
@@ -509,7 +586,7 @@ async def gemini_2_0_flash_complete(
             "Keyword extraction enabled, setting response_mime_type to application/json and providing schema."
         )
     return await google_complete_if_cache(
-        "gemini-2.0-flash-001",
+        "gemini-2.5-flash-lite",
         prompt=prompt,
         system_prompt=system_prompt,
         history_messages=history_messages,
@@ -543,6 +620,7 @@ async def google_embed(
     ] = None,  # e.g., "RETRIEVAL_DOCUMENT", "RETRIEVAL_QUERY" (Defaults to "RETRIEVAL_QUERY" if None)
     title: Optional[str] = None,  # For RETRIEVAL_DOCUMENT task_type
     output_dimensionality: Optional[int] = None,  # For reducing embedding dimensions
+    **kwargs: Any,
 ) -> np.ndarray:
     """
     Generates embeddings for a list of texts using Google's embedding models during querying.
@@ -558,12 +636,15 @@ async def google_embed(
         use_vertex_ai_str = os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "false").lower()
         use_vertex_ai = use_vertex_ai_str == "true"
 
+    use_cache = kwargs.pop("use_client_cache", True)  # Allow disabling cache if needed
+    
     google_client = await create_google_async_client(
         api_key=api_key,
         project_id=project_id,
         location=location,
         use_vertex_ai=use_vertex_ai,
         client_configs=client_configs,
+        use_cache=use_cache,
     )
 
     if not model:
@@ -572,16 +653,12 @@ async def google_embed(
     logger.debug(f"Requesting embeddings for {len(texts)} texts with model {model}.")
     verbose_debug(f"Embedding texts (first 3): {texts[:3]}")
 
-    # Convert string task_type to google_types.TaskType enum if provided
-    task_type_enum: Optional = None
+    # Valid task types include: "RETRIEVAL_DOCUMENT", "RETRIEVAL_QUERY", "SEMANTIC_SIMILARITY", "CLASSIFICATION", "CLUSTERING"
+    task_type_str: Optional[str] = None
     if task_type:
-        try:
-            task_type_enum = google_types.TaskType[task_type.upper()]
-        except KeyError:
-            logger.warning(
-                f"Invalid task_type '{task_type}'. Ignoring. Valid types are: {', '.join(google_types.TaskType.__members__)}"
-            )
-            task_type_enum = None  # Defaults to "RETRIEVAL_QUERY"
+        # Normalize the task type string to uppercase
+        task_type_str = task_type.upper()
+        logger.debug(f"Using task_type: {task_type_str}")
 
     try:
         response = await google_client.aio.models.embed_content(
@@ -589,7 +666,7 @@ async def google_embed(
             contents=texts,
             config=google_types.EmbedContentConfig(
                 output_dimensionality=output_dimensionality,
-                task_type=task_type_enum,
+                task_type=task_type_str,
             ),
         )
 
@@ -627,6 +704,10 @@ async def google_embed(
         raise
 
 
+@wrap_embedding_func_with_attrs(
+    embedding_dim=DEFAULT_GOOGLE_EMBEDDING_DIM,
+    max_token_size=DEFAULT_GOOGLE_MAX_TOKEN_SIZE,
+)
 async def google_embed_insert(
     texts: List[str], task_type: str = "RETRIEVAL_DOCUMENT", **kwargs: Any
 ) -> np.ndarray:
