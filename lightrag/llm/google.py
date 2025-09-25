@@ -76,7 +76,7 @@ RETRYABLE_GOOGLE_EXCEPTIONS = (
 
 DEFAULT_GOOGLE_GEMINI_MODEL = "gemini-2.5-flash-lite"
 DEFAULT_GOOGLE_EMBEDDING_MODEL = "gemini-embedding-001"
-DEFAULT_GOOGLE_EMBEDDING_DIM = 3072
+DEFAULT_GOOGLE_EMBEDDING_DIM = 1536  # Using MRL to reduce from default 3072
 DEFAULT_GOOGLE_MAX_TOKEN_SIZE = 8192
 
 # Global client cache
@@ -660,6 +660,11 @@ async def google_embed(
         task_type_str = task_type.upper()
         logger.debug(f"Using task_type: {task_type_str}")
 
+    # Set output_dimensionality to 1536 if not specified
+    # gemini-embedding-001 outputs 3072 by default, but we want 1536 for consistency
+    if output_dimensionality is None:
+        output_dimensionality = DEFAULT_GOOGLE_EMBEDDING_DIM  # 1536
+
     try:
         response = await google_client.aio.models.embed_content(
             model=model,
@@ -714,4 +719,7 @@ async def google_embed_insert(
     """
     Generates embeddings for a list of texts using Google's embedding models during insertion.
     """
+    # Ensure output_dimensionality matches the wrapper's embedding_dim if not specified
+    if "output_dimensionality" not in kwargs:
+        kwargs["output_dimensionality"] = DEFAULT_GOOGLE_EMBEDDING_DIM  # 1536
     return await google_embed(texts=texts, task_type=task_type, **kwargs)
