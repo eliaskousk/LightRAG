@@ -1,14 +1,8 @@
-import sys
 import os
 import logging
-import hashlib
 import numpy as np
 from typing import Any, Union, Optional, List, Dict
-
-if sys.version_info < (3, 9):
-    from typing import AsyncIterator as TypingAsyncIterator
-else:
-    from collections.abc import AsyncIterator as TypingAsyncIterator
+from collections.abc import AsyncIterator as TypingAsyncIterator
 
 import pipmaster as pm
 
@@ -40,6 +34,7 @@ from lightrag.utils import (
     wrap_embedding_func_with_attrs,
     # locate_json_string_body_from_string, # May not be needed if response_schema is robust
     safe_unicode_decode,
+    remove_think_tags,
     logger,
     verbose_debug,
     VERBOSE_DEBUG,
@@ -68,15 +63,15 @@ RETRYABLE_GOOGLE_EXCEPTIONS = (
     google_api_exceptions.InternalServerError,  # HTTP 500
     google_api_exceptions.Unknown,  # HTTP 500 (often)
     google_api_exceptions.Aborted,  # Context-dependent, can be retryable
+    google_api_exceptions.GatewayTimeout,  # HTTP 504
+    google_api_exceptions.BadGateway,  # HTTP 502
     InvalidResponseError,  # Custom error for empty/malformed success
-    # google_types.generation_types.BrokenResponseError (if applicable and defined)
-    # google_types.StopCandidateException (if indicates a retryable state)
 )
 
 
-DEFAULT_GOOGLE_GEMINI_MODEL = "gemini-2.5-flash-lite-latest"
+DEFAULT_GOOGLE_GEMINI_MODEL = "gemini-3-flash-preview"
 DEFAULT_GOOGLE_EMBEDDING_MODEL = "gemini-embedding-001"
-DEFAULT_GOOGLE_EMBEDDING_DIM = 1536  # Using MRL to reduce from default 3072
+DEFAULT_GOOGLE_EMBEDDING_DIM = 768  # Using MRL to reduce from default 3072
 DEFAULT_GOOGLE_MAX_TOKEN_SIZE = 8192
 
 # Global client cache
@@ -136,6 +131,8 @@ async def create_google_async_client(
     use_vertex_ai: Optional[bool] = None,
     client_configs: Optional[Dict[str, Any]] = None,
     use_cache: bool = True,
+    base_url: Optional[str] = None,
+    timeout: Optional[int] = None,
 ) -> GoogleGenAIClient:
     """
     Creates an asynchronous Google Generative AI client.
@@ -176,7 +173,16 @@ async def create_google_async_client(
         "User-Agent": f"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_8) LightRAG/{__api_version__}",
         # Content-Type is typically handled by the SDK per request
     }
-    http_options = {"headers": default_headers}
+    http_options: Dict[str, Any] = {"headers": default_headers}
+
+    # Add base_url (api_endpoint) if provided
+    if base_url:
+        http_options["api_endpoint"] = base_url
+
+    # Add timeout if provided (convert seconds to milliseconds for Gemini API)
+    if timeout is not None:
+        http_options["timeout"] = timeout * 1000
+
     if client_configs and "http_options" in client_configs:
         http_options.update(client_configs.pop("http_options"))
 
@@ -231,6 +237,46 @@ async def create_google_async_client(
         return client
 
 
+def _extract_response_text(
+    response: Any, extract_thoughts: bool = False
+) -> tuple[str, str]:
+    """
+    Extract text content from Gemini response, separating regular content from thoughts.
+
+    Args:
+        response: Gemini API response object
+        extract_thoughts: Whether to extract thought content separately
+
+    Returns:
+        Tuple of (regular_text, thought_text)
+    """
+    candidates = getattr(response, "candidates", None)
+    if not candidates:
+        return ("", "")
+
+    regular_parts: List[str] = []
+    thought_parts: List[str] = []
+
+    for candidate in candidates:
+        if not getattr(candidate, "content", None):
+            continue
+        # Use 'or []' to handle None values from parts attribute
+        for part in getattr(candidate.content, "parts", None) or []:
+            text = getattr(part, "text", None)
+            if not text:
+                continue
+
+            # Check if this part is thought content using the 'thought' attribute
+            is_thought = getattr(part, "thought", False)
+
+            if is_thought and extract_thoughts:
+                thought_parts.append(text)
+            elif not is_thought:
+                regular_parts.append(text)
+
+    return ("\n".join(regular_parts), "\n".join(thought_parts))
+
+
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=4, max=10),
@@ -247,11 +293,45 @@ async def google_complete_if_cache(
     location: Optional[str] = None,
     use_vertex_ai: Optional[bool] = None,
     token_tracker: Optional[Any] = None,
+    enable_cot: bool = False,
+    base_url: Optional[str] = None,
+    timeout: Optional[int] = None,
     **kwargs: Any,
-) -> str:
+) -> Union[str, TypingAsyncIterator[str]]:
     """
     Core function to complete a prompt using Google's Generative AI API.
     Handles client creation, request formatting, API call, and response processing.
+
+    This function supports automatic integration of reasoning content from Gemini models
+    that provide Chain of Thought capabilities via the thinking_config API feature.
+
+    COT Integration:
+    - When enable_cot=True: Thought content is wrapped in <think>...</think> tags
+    - When enable_cot=False: Thought content is filtered out, only regular content returned
+    - Thought content is identified by the 'thought' attribute on response parts
+
+    Args:
+        model: The Gemini model to use.
+        prompt: The prompt to complete.
+        system_prompt: Optional system prompt to include.
+        history_messages: Optional list of previous messages in the conversation.
+        api_key: Optional API key. If None, uses environment variable.
+        project_id: Optional Google Cloud project ID for Vertex AI.
+        location: Optional Google Cloud location for Vertex AI.
+        use_vertex_ai: Whether to use Vertex AI instead of Gemini API.
+        token_tracker: Optional token usage tracker for monitoring API usage.
+        enable_cot: Whether to include Chain of Thought content in the response.
+        base_url: Optional custom API endpoint.
+        timeout: Request timeout in seconds (converted to milliseconds for Gemini API).
+        **kwargs: Additional generation parameters (temperature, max_output_tokens, etc.)
+
+    Returns:
+        The completed text (with COT content if enable_cot=True) or an async iterator
+        of text chunks if streaming. COT content is wrapped in <think>...</think> tags.
+
+    Raises:
+        InvalidResponseError: If the response from Google API is empty or blocked.
+        ValueError: If API key or Vertex AI configuration is not provided.
     """
     if not VERBOSE_DEBUG and logging.getLogger("google_genai").level != logging.WARNING:
         logging.getLogger("google_genai").setLevel(
@@ -268,6 +348,8 @@ async def google_complete_if_cache(
         use_vertex_ai=use_vertex_ai,
         client_configs=client_call_configs,
         use_cache=use_cache,
+        base_url=base_url,
+        timeout=timeout,
     )
 
     # Prepare contents for API call
@@ -367,34 +449,91 @@ async def google_complete_if_cache(
 
             async def stream_generator():
                 full_response_text_for_log = []
+                # COT state tracking for streaming
+                cot_active = False
+                cot_started = False
+                initial_content_seen = False
+
                 try:
                     async for chunk in response_iter:
-                        if not hasattr(chunk, "text") or chunk.text is None:
-                            # Sometimes, finish_reason or other metadata might come in a chunk without text
+                        # Extract both regular and thought content from chunk
+                        regular_text, thought_text = _extract_response_text(
+                            chunk, extract_thoughts=True
+                        )
+
+                        # Handle empty chunks
+                        if not regular_text and not thought_text:
+                            # Check for finish_reason metadata
                             if (
                                 hasattr(chunk, "candidates")
                                 and chunk.candidates
-                                and hasattr(chunk.candidates, "finish_reason")
-                                and chunk.candidates.finish_reason
                             ):
-                                logger.debug(
-                                    f"Stream chunk finish_reason: {chunk.candidates.finish_reason.name}"
-                                )
-                            else:
-                                logger.warning(
-                                    f"Received stream chunk without text: {chunk}"
-                                )
+                                for candidate in chunk.candidates:
+                                    if hasattr(candidate, "finish_reason") and candidate.finish_reason:
+                                        logger.debug(
+                                            f"Stream chunk finish_reason: {candidate.finish_reason.name}"
+                                        )
                             continue
 
-                        content_text = chunk.text
-                        if r"\u" in content_text:  # Handle unicode escapes if any
-                            content_text = safe_unicode_decode(
-                                content_text.encode("utf-8")
-                            )
+                        if enable_cot:
+                            # Process regular content
+                            if regular_text:
+                                if not initial_content_seen:
+                                    initial_content_seen = True
 
-                        full_response_text_for_log.append(content_text)
-                        yield content_text
+                                # Close COT section if it was active
+                                if cot_active:
+                                    yield "</think>"
+                                    cot_active = False
+
+                                # Send regular content
+                                content_text = regular_text
+                                if r"\u" in content_text:
+                                    content_text = safe_unicode_decode(
+                                        content_text.encode("utf-8")
+                                    )
+                                full_response_text_for_log.append(content_text)
+                                yield content_text
+
+                            # Process thought content
+                            if thought_text:
+                                if not initial_content_seen and not cot_started:
+                                    # Start COT section
+                                    yield "<think>"
+                                    cot_active = True
+                                    cot_started = True
+
+                                # Send thought content if COT is active
+                                if cot_active:
+                                    content_text = thought_text
+                                    if r"\u" in content_text:
+                                        content_text = safe_unicode_decode(
+                                            content_text.encode("utf-8")
+                                        )
+                                    full_response_text_for_log.append(content_text)
+                                    yield content_text
+                        else:
+                            # COT disabled - only send regular content
+                            if regular_text:
+                                content_text = regular_text
+                                if r"\u" in content_text:
+                                    content_text = safe_unicode_decode(
+                                        content_text.encode("utf-8")
+                                    )
+                                full_response_text_for_log.append(content_text)
+                                yield content_text
+
+                    # Ensure COT is properly closed if still active
+                    if cot_active:
+                        yield "</think>"
+
                 except Exception as e:
+                    # Try to close COT tag before reporting error
+                    if cot_active:
+                        try:
+                            yield "</think>"
+                        except Exception:
+                            pass
                     logger.error(f"Error during Google API stream processing: {e}")
                     raise
                 finally:
@@ -413,39 +552,66 @@ async def google_complete_if_cache(
                 config=generation_config_obj,
             )
 
-            if not response or not response.text:  # Check for empty response
+            # Extract both regular text and thought text using the helper
+            regular_text, thought_text = _extract_response_text(response, extract_thoughts=True)
+
+            # Check for empty response and blocking reasons
+            if not regular_text and not thought_text:
                 # Check for blocking reasons
                 if (
                     response
+                    and hasattr(response, "prompt_feedback")
                     and response.prompt_feedback
                     and response.prompt_feedback.block_reason
                 ):
                     err_msg = f"Google API request was blocked. Reason: {response.prompt_feedback.block_reason_message or response.prompt_feedback.block_reason.name}"
                     logger.error(err_msg)
-                    raise InvalidResponseError(
-                        err_msg
-                    )  # This could be a non-retryable error depending on policy
+                    raise InvalidResponseError(err_msg)
 
                 # Check candidates for blocking
-                if response and response.candidates:
+                if response and hasattr(response, "candidates") and response.candidates:
                     for candidate in response.candidates:
                         if (
-                            candidate.finish_reason.name == "SAFETY"
-                        ):  # FinishReason.SAFETY
+                            hasattr(candidate, "finish_reason")
+                            and candidate.finish_reason
+                            and candidate.finish_reason.name == "SAFETY"
+                        ):
                             err_msg = f"Google API response candidate blocked due to safety. Ratings: {candidate.safety_ratings}"
                             logger.error(err_msg)
-                            raise InvalidResponseError(err_msg)  # Likely non-retryable
+                            raise InvalidResponseError(err_msg)
 
                 logger.error(
                     "Received empty or invalid content from Google API non-streaming response."
                 )
                 raise InvalidResponseError("Received empty content from Google API.")
 
-            content_to_return = response.text
+            # Apply COT filtering logic based on enable_cot parameter
+            if enable_cot:
+                # Include thought content wrapped in <think> tags
+                if thought_text and thought_text.strip():
+                    if not regular_text or regular_text.strip() == "":
+                        # Only thought content available
+                        content_to_return = f"<think>{thought_text}</think>"
+                    else:
+                        # Both content types present: prepend thought to regular content
+                        content_to_return = f"<think>{thought_text}</think>{regular_text}"
+                else:
+                    # No thought content, use regular content only
+                    content_to_return = regular_text or ""
+            else:
+                # Filter out thought content, return only regular content
+                content_to_return = regular_text or ""
+
+            if not content_to_return:
+                raise InvalidResponseError("Google API response did not contain any text content.")
+
             if r"\u" in content_to_return:
                 content_to_return = safe_unicode_decode(
                     content_to_return.encode("utf-8")
                 )
+
+            # Remove think tags if not in COT mode (for consistency)
+            content_to_return = remove_think_tags(content_to_return)
 
             # Token tracking for non-streaming
             if (
@@ -471,11 +637,8 @@ async def google_complete_if_cache(
             )
             verbose_debug(
                 f"Google API Response: {content_to_return[:500]}{'...' if len(content_to_return) > 500 else ''}"
-            )  # Log snippet
+            )
 
-            # For JSON mode, response.text is the JSON string.
-            # If response_schema was used, response.parsed might contain the Pydantic model.
-            # LightRAG expects the string representation for now.
             return content_to_return
 
     except google_api_exceptions.GoogleAPIError as e:
@@ -615,15 +778,42 @@ async def google_embed(
     location: Optional[str] = None,
     use_vertex_ai: Optional[bool] = None,
     client_configs: Optional[dict] = None,
-    task_type: Optional[
-        str
-    ] = None,  # e.g., "RETRIEVAL_DOCUMENT", "RETRIEVAL_QUERY" (Defaults to "RETRIEVAL_QUERY" if None)
-    title: Optional[str] = None,  # For RETRIEVAL_DOCUMENT task_type
-    output_dimensionality: Optional[int] = None,  # For reducing embedding dimensions
+    task_type: Optional[str] = None,
+    title: Optional[str] = None,
+    output_dimensionality: Optional[int] = None,
+    base_url: Optional[str] = None,
+    timeout: Optional[int] = None,
     **kwargs: Any,
 ) -> np.ndarray:
     """
-    Generates embeddings for a list of texts using Google's embedding models during querying.
+    Generates embeddings for a list of texts using Google's embedding models.
+
+    This function uses Google's Gemini embedding model to generate text embeddings.
+    It supports dynamic dimension control and automatic L2 normalization for dimensions
+    less than 3072.
+
+    Args:
+        texts: List of texts to embed.
+        model: The Gemini embedding model to use. Default is from env or "gemini-embedding-001".
+        api_key: Optional API key. If None, uses environment variables.
+        project_id: Optional Google Cloud project ID for Vertex AI.
+        location: Optional Google Cloud location for Vertex AI.
+        use_vertex_ai: Whether to use Vertex AI instead of Gemini API.
+        client_configs: Optional additional client configuration.
+        task_type: Task type for embedding optimization (e.g., "RETRIEVAL_DOCUMENT", "RETRIEVAL_QUERY").
+        title: Optional title for RETRIEVAL_DOCUMENT task_type.
+        output_dimensionality: Optional embedding dimension for dynamic dimension reduction.
+            Supported range: 128-3072. Recommended values: 768, 1536, 3072.
+        base_url: Optional custom API endpoint.
+        timeout: Request timeout in seconds (converted to milliseconds for Gemini API).
+        **kwargs: Additional parameters.
+
+    Returns:
+        A numpy array of embeddings, one per input text. For dimensions < 3072,
+        the embeddings are L2-normalized to ensure optimal semantic similarity performance.
+
+    Raises:
+        InvalidResponseError: If the response from Google API is invalid or empty.
     """
     if not texts:
         return np.array()
@@ -637,7 +827,7 @@ async def google_embed(
         use_vertex_ai = use_vertex_ai_str == "true"
 
     use_cache = kwargs.pop("use_client_cache", True)  # Allow disabling cache if needed
-    
+
     google_client = await create_google_async_client(
         api_key=api_key,
         project_id=project_id,
@@ -645,6 +835,8 @@ async def google_embed(
         use_vertex_ai=use_vertex_ai,
         client_configs=client_configs,
         use_cache=use_cache,
+        base_url=base_url,
+        timeout=timeout,
     )
 
     if not model:
@@ -697,7 +889,21 @@ async def google_embed(
                     f"Some embeddings have dimension other than requested {output_dimensionality}. Check API behavior."
                 )
 
-        return np.array(embeddings_list, dtype=np.float32)
+        embeddings = np.array(embeddings_list, dtype=np.float32)
+
+        # Apply L2 normalization for dimensions < 3072
+        # The 3072 dimension embedding is already normalized by Gemini API
+        if output_dimensionality and output_dimensionality < 3072:
+            # Normalize each embedding vector to unit length
+            norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+            # Avoid division by zero
+            norms = np.where(norms == 0, 1, norms)
+            embeddings = embeddings / norms
+            logger.debug(
+                f"Applied L2 normalization to {len(embeddings)} embeddings of dimension {output_dimensionality}"
+            )
+
+        return embeddings
 
     except google_api_exceptions.GoogleAPIError as e:
         logger.error(f"Google API Error during embedding: {e.__class__.__name__} - {e}")
