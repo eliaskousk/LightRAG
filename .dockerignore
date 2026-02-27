@@ -62,6 +62,9 @@ temp/
 # file
 TODO.md
 
+# Node modules (must install fresh inside container for correct platform binaries)
+**/node_modules
+
 # Exclude Git-related files
 .git
 .github

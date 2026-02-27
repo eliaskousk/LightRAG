@@ -1,0 +1,31 @@
+# Include the default .gitignore rules
+#!include:.gitignore
+
+# Node modules — installed fresh during container build
+**/node_modules
+
+# Python virtual environments
+**/.venv
+**/venv
+
+# Local data and caches
+/data
+/rag_storage
+/inputs
+/dickens
+__pycache__
+.cache
+.mypy_cache
+.pytest_cache
+.ruff_cache
+
+# Git
+.git
+.github
+
+# Tests (not needed in container)
+/tests
+
+# IDE / OS
+.vscode
+.DS_Store

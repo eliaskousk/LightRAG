@@ -1,0 +1,151 @@
+# Cloud Run service definition for CPQAI
+#
+# Deploy with:
+#   gcloud run services replace deploy/gcp/cloudrun-service.yaml \
+#     --region=us-central1
+#
+# Before deploying, replace the following placeholders:
+#   PROJECT_ID   – your GCP project ID
+#   REGION       – e.g. us-central1
+#   DB_HOST      – PostgreSQL VM internal IP (e.g. 10.128.0.2)
+
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: cpqai
+  labels:
+    cloud.googleapis.com/location: REGION
+  annotations:
+    run.googleapis.com/description: "CPQAI - Graph-based RAG system"
+    run.googleapis.com/ingress: all
+    run.googleapis.com/launch-stage: GA
+spec:
+  template:
+    metadata:
+      annotations:
+        # Scaling
+        autoscaling.knative.dev/minScale: "0"
+        autoscaling.knative.dev/maxScale: "10"
+        # Startup CPU boost for faster cold starts
+        run.googleapis.com/startup-cpu-boost: "true"
+        # CPU always allocated — keeps DB connections alive between requests
+        run.googleapis.com/cpu-throttling: "false"
+        # Direct VPC egress — reach the DB VM via internal IP
+        run.googleapis.com/network-interfaces: '[{"network":"default","subnetwork":"default"}]'
+        run.googleapis.com/vpc-access-egress: private-ranges-only
+    spec:
+      containerConcurrency: 80
+      timeoutSeconds: 300
+      serviceAccountName: cpqai-sa@PROJECT_ID.iam.gserviceaccount.com
+      containers:
+        - image: REGION-docker.pkg.dev/PROJECT_ID/cpqai/cpqai:latest
+          ports:
+            - name: http1
+              containerPort: 8080
+
+          resources:
+            limits:
+              cpu: "2"
+              memory: 4Gi
+
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 12
+            timeoutSeconds: 3
+
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            periodSeconds: 30
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          env:
+            # ── Server ────────────────────────────────────────────
+            - name: HOST
+              value: "0.0.0.0"
+            - name: PORT
+              value: "8080"
+
+            # ── Vertex AI ─────────────────────────────────────────
+            - name: GOOGLE_GENAI_USE_VERTEXAI
+              value: "true"
+            - name: GOOGLE_CLOUD_PROJECT
+              value: PROJECT_ID
+            - name: GOOGLE_CLOUD_LOCATION
+              value: global
+            - name: LLM_BINDING
+              value: gemini
+            - name: LLM_BINDING_HOST
+              value: DEFAULT_GEMINI_ENDPOINT
+            - name: LLM_MODEL
+              value: gemini-3-flash-preview
+            - name: EMBEDDING_BINDING
+              value: gemini
+            - name: EMBEDDING_MODEL
+              value: gemini-embedding-001
+            - name: EMBEDDING_DIM
+              value: "1536"
+            - name: EMBEDDING_SEND_DIM
+              value: "true"
+
+            # ── Storage backends (all PostgreSQL) ─────────────────
+            - name: LIGHTRAG_KV_STORAGE
+              value: PGKVStorage
+            - name: LIGHTRAG_DOC_STATUS_STORAGE
+              value: PGDocStatusStorage
+            - name: LIGHTRAG_GRAPH_STORAGE
+              value: PGGraphStorage
+            - name: LIGHTRAG_VECTOR_STORAGE
+              value: PGVectorStorage
+
+            # ── PostgreSQL connection (VM internal IP via VPC) ────
+            - name: POSTGRES_HOST
+              value: DB_HOST
+            - name: POSTGRES_PORT
+              value: "5432"
+            - name: POSTGRES_USER
+              value: cpqai
+            - name: POSTGRES_DATABASE
+              value: cpqai
+            - name: POSTGRES_MAX_CONNECTIONS
+              value: "12"
+            - name: POSTGRES_ENABLE_VECTOR
+              value: "true"
+            - name: POSTGRES_VECTOR_INDEX_TYPE
+              value: HNSW
+
+            # ── Connection retry ──────────────────────────────────
+            - name: POSTGRES_CONNECTION_RETRIES
+              value: "10"
+            - name: POSTGRES_CONNECTION_RETRY_BACKOFF
+              value: "3.0"
+            - name: POSTGRES_CONNECTION_RETRY_BACKOFF_MAX
+              value: "30.0"
+
+            # ── Tuning ────────────────────────────────────────────
+            - name: ENABLE_LLM_CACHE
+              value: "true"
+            - name: MAX_ASYNC
+              value: "4"
+            - name: MAX_PARALLEL_INSERT
+              value: "2"
+            - name: SUMMARY_LANGUAGE
+              value: English
+
+            # ── Secrets from Secret Manager ───────────────────────
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  key: latest
+                  name: cpqai-db-password
+            - name: LIGHTRAG_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: latest
+                  name: cpqai-api-key
