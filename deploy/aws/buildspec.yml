@@ -1,0 +1,55 @@
+# CodeBuild configuration for CPQAI on AWS
+#
+# Usage:
+#   Triggered by CodeBuild project created in setup.sh, or manually:
+#   aws codebuild start-build --project-name cpqai
+#
+# Environment variables (set in CodeBuild project):
+#   AWS_ACCOUNT_ID   – AWS account ID
+#   AWS_REGION       – AWS region (default: us-east-1)
+#   ECR_REPO         – ECR repository name (default: cpqai)
+#   SERVICE_NAME     – App Runner service name (default: cpqai)
+#   SERVICE_ARN      – App Runner service ARN (for update trigger)
+
+version: 0.2
+
+env:
+  variables:
+    AWS_REGION: us-east-1
+    ECR_REPO: cpqai
+    SERVICE_NAME: cpqai
+
+phases:
+  pre_build:
+    commands:
+      - echo "Logging in to Amazon ECR..."
+      - aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+      - IMAGE_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}"
+      - BUILD_TAG=$(date +%Y%m%d-%H%M%S)
+
+  build:
+    commands:
+      - echo "Building Docker image..."
+      # Dockerfile.apprunner uses ECR Public base images (no Docker Hub rate limits)
+      - |
+        docker build -f Dockerfile.apprunner \
+          -t "${IMAGE_URI}:${BUILD_TAG}" \
+          -t "${IMAGE_URI}:latest" .
+
+  post_build:
+    commands:
+      # Only push if the build phase succeeded
+      - |
+        if [ "$CODEBUILD_BUILD_SUCCEEDING" = "1" ]; then
+          echo "Pushing image to ECR..."
+          docker push "${IMAGE_URI}:${BUILD_TAG}"
+          docker push "${IMAGE_URI}:latest"
+          if [ -n "$SERVICE_ARN" ]; then
+            echo "Triggering App Runner deployment..."
+            aws apprunner start-deployment --service-arn "$SERVICE_ARN" || echo "App Runner deployment trigger skipped (service may not be in RUNNING state)"
+          else
+            echo "SERVICE_ARN not set — skipping App Runner deployment trigger"
+          fi
+        else
+          echo "Build failed — skipping push and deploy"
+        fi
