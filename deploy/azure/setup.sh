@@ -214,20 +214,18 @@ else
   ok "ACR '$ACR_NAME' created"
 fi
 
-ACR_ID=$(az acr show --name "$ACR_NAME" --resource-group "$RESOURCE_GROUP" \
-  --query id --output tsv)
 ACR_LOGIN_SERVER=$(az acr show --name "$ACR_NAME" --resource-group "$RESOURCE_GROUP" \
   --query loginServer --output tsv)
 
-# Grant managed identity AcrPull role
-info "Granting AcrPull role to managed identity..."
-az role assignment create \
-  --assignee-object-id "$IDENTITY_PRINCIPAL_ID" \
-  --assignee-principal-type ServicePrincipal \
-  --role AcrPull \
-  --scope "$ACR_ID" \
-  --output none 2>/dev/null || true
-ok "AcrPull role assigned"
+# Enable admin credentials for image pulls (no role assignments needed)
+info "Enabling ACR admin credentials..."
+az acr update --name "$ACR_NAME" --resource-group "$RESOURCE_GROUP" \
+  --admin-enabled true --output none
+ACR_USERNAME=$(az acr credential show --name "$ACR_NAME" --resource-group "$RESOURCE_GROUP" \
+  --query username --output tsv)
+ACR_PASSWORD=$(az acr credential show --name "$ACR_NAME" --resource-group "$RESOURCE_GROUP" \
+  --query "passwords[0].value" --output tsv)
+ok "ACR admin credentials enabled"
 
 # ── 6. Azure OpenAI Service ───────────────────────────────────────
 info "Creating Azure OpenAI resource..."
@@ -297,7 +295,12 @@ fi
 DB_PASSWORD=$(openssl rand -base64 24 | tr -d '/+=' | head -c 32)
 API_KEY=$(openssl rand -base64 32 | tr -d '/+=' | head -c 40)
 
-# ── 8. Key Vault ──────────────────────────────────────────────────
+# ── 8. Key Vault + Secrets ────────────────────────────────────────
+# Try to store secrets in Key Vault for production use. If the current user
+# lacks Key Vault permissions (common with Contributor-only roles), fall back
+# to passing secrets directly to the Container App.
+USE_KEYVAULT=false
+
 info "Creating Key Vault..."
 if az keyvault show --name "$KV_NAME" --resource-group "$RESOURCE_GROUP" &>/dev/null; then
   ok "Key Vault '$KV_NAME' already exists"
@@ -306,7 +309,6 @@ else
     --name "$KV_NAME" \
     --resource-group "$RESOURCE_GROUP" \
     --location "$LOCATION" \
-    --enable-rbac-authorization true \
     --output none
   ok "Key Vault '$KV_NAME' created"
 fi
@@ -316,54 +318,50 @@ KV_ID=$(az keyvault show --name "$KV_NAME" --resource-group "$RESOURCE_GROUP" \
 VAULT_URI=$(az keyvault show --name "$KV_NAME" --resource-group "$RESOURCE_GROUP" \
   --query properties.vaultUri --output tsv)
 
-# Grant managed identity Key Vault Secrets User role
-info "Granting Key Vault Secrets User role to managed identity..."
-az role assignment create \
-  --assignee-object-id "$IDENTITY_PRINCIPAL_ID" \
-  --assignee-principal-type ServicePrincipal \
-  --role "Key Vault Secrets User" \
-  --scope "$KV_ID" \
-  --output none 2>/dev/null || true
-ok "Key Vault Secrets User role assigned"
-
-# Grant current user Key Vault Secrets Officer role (to set secrets)
-CURRENT_USER_ID=$(az ad signed-in-user show --query id --output tsv 2>/dev/null) || true
-if [[ -n "$CURRENT_USER_ID" ]]; then
-  az role assignment create \
-    --assignee-object-id "$CURRENT_USER_ID" \
-    --assignee-principal-type User \
-    --role "Key Vault Secrets Officer" \
-    --scope "$KV_ID" \
-    --output none 2>/dev/null || true
+# Try to switch to access-policy mode (creator gets automatic permissions).
+# This may fail on existing RBAC vaults if the user lacks authorization/write.
+if az keyvault update --name "$KV_NAME" --resource-group "$RESOURCE_GROUP" \
+    --enable-rbac-authorization false --output none 2>/dev/null; then
+  # Grant current user a secret-set access policy (covers existing vaults
+  # where the default policy may have been removed)
+  CURRENT_USER_OID=$(az ad signed-in-user show --query id --output tsv 2>/dev/null) || true
+  if [[ -n "$CURRENT_USER_OID" ]]; then
+    az keyvault set-policy --name "$KV_NAME" --resource-group "$RESOURCE_GROUP" \
+      --object-id "$CURRENT_USER_OID" \
+      --secret-permissions set --output none 2>/dev/null || true
+  fi
 fi
 
-# Wait for RBAC propagation (Key Vault RBAC assignments can take up to 30s)
-info "Waiting for RBAC propagation..."
-for i in $(seq 1 6); do
-  if az keyvault secret set --vault-name "$KV_NAME" --name "rbac-test" \
-      --value "test" --output none 2>/dev/null; then
-    az keyvault secret delete --vault-name "$KV_NAME" --name "rbac-test" \
-      --output none 2>/dev/null || true
-    az keyvault secret purge --vault-name "$KV_NAME" --name "rbac-test" \
-      --output none 2>/dev/null || true
-    break
-  fi
-  sleep 10
-done
-
-# Store secrets
+# Try to store secrets (works via access policy or existing RBAC role)
 info "Storing secrets in Key Vault..."
-az keyvault secret set --vault-name "$KV_NAME" --name cpqai-db-password \
-  --value "$DB_PASSWORD" --output none 2>/dev/null
-ok "Secret 'cpqai-db-password' stored"
+if az keyvault secret set --vault-name "$KV_NAME" --name cpqai-db-password \
+    --value "$DB_PASSWORD" --output none 2>/dev/null; then
+  ok "Secret 'cpqai-db-password' stored"
 
-az keyvault secret set --vault-name "$KV_NAME" --name cpqai-api-key \
-  --value "$API_KEY" --output none 2>/dev/null
-ok "Secret 'cpqai-api-key' stored"
+  az keyvault secret set --vault-name "$KV_NAME" --name cpqai-api-key \
+    --value "$API_KEY" --output none
+  ok "Secret 'cpqai-api-key' stored"
 
-az keyvault secret set --vault-name "$KV_NAME" --name cpqai-aoai-key \
-  --value "$AOAI_KEY" --output none 2>/dev/null
-ok "Secret 'cpqai-aoai-key' stored"
+  az keyvault secret set --vault-name "$KV_NAME" --name cpqai-aoai-key \
+    --value "$AOAI_KEY" --output none
+  ok "Secret 'cpqai-aoai-key' stored"
+
+  # Enable RBAC + grant managed identity access for runtime
+  az keyvault update --name "$KV_NAME" --resource-group "$RESOURCE_GROUP" \
+    --enable-rbac-authorization true --output none 2>/dev/null || true
+  az role assignment create \
+    --assignee-object-id "$IDENTITY_PRINCIPAL_ID" \
+    --assignee-principal-type ServicePrincipal \
+    --role "Key Vault Secrets User" \
+    --scope "$KV_ID" \
+    --output none 2>/dev/null || true
+  ok "Key Vault configured for runtime access"
+  USE_KEYVAULT=true
+else
+  warn "Cannot write to Key Vault (insufficient permissions)"
+  warn "Secrets will be passed directly to the Container App"
+  warn "To use Key Vault, ask your admin to grant you 'Key Vault Secrets Officer' on $KV_NAME"
+fi
 
 # ── 9. PostgreSQL VM ──────────────────────────────────────────────
 info "Creating PostgreSQL VM..."
@@ -487,7 +485,8 @@ az acr build \
   --image "${SERVICE_NAME}:${BUILD_TAG}" \
   --image "${SERVICE_NAME}:latest" \
   --file Dockerfile.containerapp \
-  . --no-logs
+  --timeout 1800 \
+  .
 
 ok "Container image built and pushed to ACR"
 
@@ -515,20 +514,44 @@ fi
 info "Creating Container App..."
 
 if az containerapp show --name "$SERVICE_NAME" --resource-group "$RESOURCE_GROUP" &>/dev/null; then
-  ok "Container App '$SERVICE_NAME' already exists — updating image"
+  ok "Container App '$SERVICE_NAME' already exists — updating"
+  # Ensure registry uses admin credentials (may have been created with managed identity)
+  az containerapp registry set \
+    --name "$SERVICE_NAME" \
+    --resource-group "$RESOURCE_GROUP" \
+    --server "$ACR_LOGIN_SERVER" \
+    --username "$ACR_USERNAME" \
+    --password "$ACR_PASSWORD" \
+    --output none
   az containerapp update \
     --name "$SERVICE_NAME" \
     --resource-group "$RESOURCE_GROUP" \
     --image "${ACR_LOGIN_SERVER}/${SERVICE_NAME}:${BUILD_TAG}" \
     --output none
 else
+  # Build secrets args: Key Vault references if available, direct values otherwise
+  if [[ "$USE_KEYVAULT" == "true" ]]; then
+    CA_SECRETS=(
+      "db-password=keyvaultref:${VAULT_URI}secrets/cpqai-db-password,identityref:${IDENTITY_ID}"
+      "api-key=keyvaultref:${VAULT_URI}secrets/cpqai-api-key,identityref:${IDENTITY_ID}"
+      "aoai-key=keyvaultref:${VAULT_URI}secrets/cpqai-aoai-key,identityref:${IDENTITY_ID}"
+    )
+  else
+    CA_SECRETS=(
+      "db-password=$DB_PASSWORD"
+      "api-key=$API_KEY"
+      "aoai-key=$AOAI_KEY"
+    )
+  fi
+
   az containerapp create \
     --name "$SERVICE_NAME" \
     --resource-group "$RESOURCE_GROUP" \
     --environment "$ENV_NAME" \
     --image "${ACR_LOGIN_SERVER}/${SERVICE_NAME}:latest" \
     --registry-server "$ACR_LOGIN_SERVER" \
-    --registry-identity "$IDENTITY_ID" \
+    --registry-username "$ACR_USERNAME" \
+    --registry-password "$ACR_PASSWORD" \
     --user-assigned "$IDENTITY_ID" \
     --target-port 8080 \
     --ingress external \
@@ -536,10 +559,7 @@ else
     --max-replicas 10 \
     --cpu 2 \
     --memory 4Gi \
-    --secrets \
-      "db-password=keyvaultref:${VAULT_URI}secrets/cpqai-db-password,identityref:${IDENTITY_ID}" \
-      "api-key=keyvaultref:${VAULT_URI}secrets/cpqai-api-key,identityref:${IDENTITY_ID}" \
-      "aoai-key=keyvaultref:${VAULT_URI}secrets/cpqai-aoai-key,identityref:${IDENTITY_ID}" \
+    --secrets "${CA_SECRETS[@]}" \
     --env-vars \
       "POSTGRES_HOST=${DB_PRIVATE_IP}" \
       "POSTGRES_PORT=5432" \
@@ -653,10 +673,14 @@ echo ""
 echo "  Test:"
 echo "    curl -H 'X-API-Key: ${API_KEY}' https://${SERVICE_URL}/health"
 echo ""
-echo "  Secrets stored in Key Vault ($KV_NAME):"
-echo "    - cpqai-db-password"
-echo "    - cpqai-api-key"
-echo "    - cpqai-aoai-key"
+if [[ "$USE_KEYVAULT" == "true" ]]; then
+  echo "  Secrets stored in Key Vault ($KV_NAME):"
+  echo "    - cpqai-db-password"
+  echo "    - cpqai-api-key"
+  echo "    - cpqai-aoai-key"
+else
+  echo "  Secrets:        passed directly to Container App"
+fi
 echo ""
 echo "  DB VM management:"
 echo "    az vm start --name $DB_VM_NAME --resource-group $RESOURCE_GROUP"
@@ -673,5 +697,9 @@ if [[ "$ENABLE_APIM" == "true" ]]; then
   echo "  APIM gateway:   ${APIM_URL:-check Azure portal}"
   echo ""
 fi
-warn "Save the API key above — it is also in Key Vault (cpqai-api-key)"
+if [[ "$USE_KEYVAULT" == "true" ]]; then
+  warn "Save the API key above — it is also in Key Vault (cpqai-api-key)"
+else
+  warn "Save the API key above — it is NOT stored in Key Vault (insufficient permissions)"
+fi
 echo ""
