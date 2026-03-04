@@ -89,27 +89,13 @@ RUN mkdir -p /app/data/rag_storage /app/data/inputs /app/data/tiktoken
 COPY --from=builder /app/data/tiktoken /app/data/tiktoken
 
 # ── Environment defaults for Container Apps ──────────────────────────
+# Only set path/runtime defaults here. All application config (LLM, embedding,
+# storage, etc.) comes from .env.azure via Container App --env-vars at deploy time.
 ENV TIKTOKEN_CACHE_DIR=/app/data/tiktoken \
     WORKING_DIR=/app/data/rag_storage \
     INPUT_DIR=/app/data/inputs \
-    # Container Apps uses PORT=8080
     PORT=8080 \
-    HOST=0.0.0.0 \
-    # All four storage backends → PostgreSQL
-    LIGHTRAG_KV_STORAGE=PGKVStorage \
-    LIGHTRAG_DOC_STATUS_STORAGE=PGDocStatusStorage \
-    LIGHTRAG_GRAPH_STORAGE=PGGraphStorage \
-    LIGHTRAG_VECTOR_STORAGE=PGVectorStorage \
-    # Azure OpenAI as LLM + embedding provider
-    LLM_BINDING=azure_openai \
-    LLM_MODEL=gpt-4.1 \
-    AZURE_OPENAI_DEPLOYMENT=gpt-4.1 \
-    AZURE_OPENAI_API_VERSION=2024-08-01-preview \
-    EMBEDDING_BINDING=azure_openai \
-    EMBEDDING_MODEL=text-embedding-3-large \
-    AZURE_EMBEDDING_DEPLOYMENT=text-embedding-3-large \
-    AZURE_EMBEDDING_API_VERSION=2023-05-15 \
-    EMBEDDING_DIM=1536
+    HOST=0.0.0.0
 
 # Container Apps uses PORT=8080 by default
 EXPOSE 8080

@@ -91,6 +91,30 @@ info "Key Vault:      $KV_NAME"
 info "APIM:           $ENABLE_APIM"
 echo ""
 
+# ── Load .env.azure configuration ─────────────────────────────────
+ENV_FILE="deploy/azure/.env.azure"
+if [[ -f "$ENV_FILE" ]]; then
+  # Source non-secret values from env file (skip comments and blank lines)
+  set -a
+  while IFS= read -r line; do
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    [[ -z "${line// }" ]] && continue
+    eval "$line" 2>/dev/null || true
+  done < "$ENV_FILE"
+  set +a
+  ok "Loaded configuration from $ENV_FILE"
+else
+  warn "$ENV_FILE not found — using defaults"
+  LLM_MODEL="${LLM_MODEL:-gpt-4.1}"
+  AZURE_OPENAI_DEPLOYMENT="${AZURE_OPENAI_DEPLOYMENT:-gpt-4.1}"
+  EMBEDDING_MODEL="${EMBEDDING_MODEL:-text-embedding-3-small}"
+  AZURE_EMBEDDING_DEPLOYMENT="${AZURE_EMBEDDING_DEPLOYMENT:-text-embedding-3-small}"
+fi
+
+info "LLM deployment:       $AZURE_OPENAI_DEPLOYMENT ($LLM_MODEL)"
+info "Embedding deployment: $AZURE_EMBEDDING_DEPLOYMENT ($EMBEDDING_MODEL)"
+echo ""
+
 # ── 1. Resource Group ──────────────────────────────────────────────
 info "Creating resource group..."
 if az group show --name "$RESOURCE_GROUP" &>/dev/null; then
@@ -232,10 +256,13 @@ info "Creating Azure OpenAI resource..."
 if az cognitiveservices account show --name "$OPENAI_NAME" --resource-group "$RESOURCE_GROUP" &>/dev/null; then
   ok "Azure OpenAI '$OPENAI_NAME' already exists"
 else
+  # Use --custom-domain to get a stable endpoint: https://<name>.openai.azure.com/
+  # Without it, Azure assigns a generic regional URL that changes on recreate.
   # Try creating; if it fails because of a soft-deleted resource, purge it first
   if ! az cognitiveservices account create \
     --name "$OPENAI_NAME" \
     --resource-group "$RESOURCE_GROUP" \
+    --custom-domain "$OPENAI_NAME" \
     --kind OpenAI \
     --sku S0 \
     --location "$LOCATION" \
@@ -250,6 +277,7 @@ else
     az cognitiveservices account create \
       --name "$OPENAI_NAME" \
       --resource-group "$RESOURCE_GROUP" \
+      --custom-domain "$OPENAI_NAME" \
       --kind OpenAI \
       --sku S0 \
       --location "$LOCATION" \
@@ -269,44 +297,44 @@ AOAI_KEY=$(az cognitiveservices account keys list \
   --query key1 --output tsv)
 ok "Azure OpenAI endpoint: $AOAI_ENDPOINT"
 
-# Create LLM deployment (GPT-4.1)
-info "Creating GPT-4.1 deployment..."
+# Create LLM deployment
+info "Creating $AZURE_OPENAI_DEPLOYMENT deployment..."
 if az cognitiveservices account deployment show \
     --name "$OPENAI_NAME" --resource-group "$RESOURCE_GROUP" \
-    --deployment-name gpt-4.1 &>/dev/null; then
-  ok "GPT-4.1 deployment already exists"
+    --deployment-name "$AZURE_OPENAI_DEPLOYMENT" &>/dev/null; then
+  ok "$AZURE_OPENAI_DEPLOYMENT deployment already exists"
 else
   az cognitiveservices account deployment create \
     --name "$OPENAI_NAME" \
     --resource-group "$RESOURCE_GROUP" \
-    --deployment-name gpt-4.1 \
-    --model-name gpt-4.1 \
+    --deployment-name "$AZURE_OPENAI_DEPLOYMENT" \
+    --model-name "$LLM_MODEL" \
     --model-version "2025-04-14" \
     --model-format OpenAI \
     --sku-name Standard \
     --sku-capacity 10 \
     --output none
-  ok "GPT-4.1 deployment created (10K TPM)"
+  ok "$AZURE_OPENAI_DEPLOYMENT deployment created (10K TPM)"
 fi
 
-# Create embedding deployment (text-embedding-3-large)
-info "Creating text-embedding-3-large deployment..."
+# Create embedding deployment
+info "Creating $AZURE_EMBEDDING_DEPLOYMENT deployment..."
 if az cognitiveservices account deployment show \
     --name "$OPENAI_NAME" --resource-group "$RESOURCE_GROUP" \
-    --deployment-name text-embedding-3-large &>/dev/null; then
-  ok "text-embedding-3-large deployment already exists"
+    --deployment-name "$AZURE_EMBEDDING_DEPLOYMENT" &>/dev/null; then
+  ok "$AZURE_EMBEDDING_DEPLOYMENT deployment already exists"
 else
   az cognitiveservices account deployment create \
     --name "$OPENAI_NAME" \
     --resource-group "$RESOURCE_GROUP" \
-    --deployment-name text-embedding-3-large \
-    --model-name text-embedding-3-large \
+    --deployment-name "$AZURE_EMBEDDING_DEPLOYMENT" \
+    --model-name "$EMBEDDING_MODEL" \
     --model-version "1" \
     --model-format OpenAI \
     --sku-name Standard \
     --sku-capacity 10 \
     --output none
-  ok "text-embedding-3-large deployment created (10K TPM)"
+  ok "$AZURE_EMBEDDING_DEPLOYMENT deployment created (10K TPM)"
 fi
 
 # ── 7. Generate DB password + API key ──────────────────────────────
@@ -541,6 +569,47 @@ fi
 # ── 12. Container App ─────────────────────────────────────────────
 info "Creating Container App..."
 
+# Parse .env.azure to build env vars for the container.
+# Skip comments, blank lines, and secret variables (injected via Key Vault / secretref).
+ENV_FILE="deploy/azure/.env.azure"
+SECRET_VARS="AZURE_OPENAI_API_KEY|AZURE_EMBEDDING_API_KEY|POSTGRES_PASSWORD|LIGHTRAG_API_KEY|AUTH_ACCOUNTS|TOKEN_SECRET"
+# Dynamic vars are overridden by values discovered during setup
+DYNAMIC_VARS="POSTGRES_HOST|POSTGRES_USER|POSTGRES_DATABASE|AZURE_OPENAI_ENDPOINT|AZURE_EMBEDDING_ENDPOINT"
+
+CA_ENV_VARS=()
+if [[ -f "$ENV_FILE" ]]; then
+  while IFS= read -r line; do
+    # Skip comments and blank lines
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    [[ -z "${line// }" ]] && continue
+    # Extract KEY=VALUE
+    key="${line%%=*}"
+    [[ "$key" =~ ^($SECRET_VARS)$ ]] && continue
+    [[ "$key" =~ ^($DYNAMIC_VARS)$ ]] && continue
+    CA_ENV_VARS+=("$line")
+  done < "$ENV_FILE"
+  ok "Loaded $(( ${#CA_ENV_VARS[@]} )) env vars from $ENV_FILE"
+else
+  warn "$ENV_FILE not found — using minimal defaults"
+fi
+
+# Add dynamic vars (discovered during setup)
+CA_ENV_VARS+=(
+  "POSTGRES_HOST=${DB_PRIVATE_IP}"
+  "POSTGRES_USER=${DB_USER}"
+  "POSTGRES_DATABASE=${DB_NAME}"
+  "AZURE_OPENAI_ENDPOINT=${AOAI_ENDPOINT}"
+  "AZURE_EMBEDDING_ENDPOINT=${AOAI_ENDPOINT}"
+)
+
+# Add secret references
+CA_ENV_VARS+=(
+  "POSTGRES_PASSWORD=secretref:db-password"
+  "LIGHTRAG_API_KEY=secretref:api-key"
+  "AZURE_OPENAI_API_KEY=secretref:aoai-key"
+  "AZURE_EMBEDDING_API_KEY=secretref:aoai-key"
+)
+
 if az containerapp show --name "$SERVICE_NAME" --resource-group "$RESOURCE_GROUP" &>/dev/null; then
   ok "Container App '$SERVICE_NAME' already exists — updating"
   # Ensure registry uses admin credentials (may have been created with managed identity)
@@ -588,19 +657,7 @@ else
     --cpu 2 \
     --memory 4Gi \
     --secrets "${CA_SECRETS[@]}" \
-    --env-vars \
-      "POSTGRES_HOST=${DB_PRIVATE_IP}" \
-      "POSTGRES_PORT=5432" \
-      "POSTGRES_USER=${DB_USER}" \
-      "POSTGRES_DATABASE=${DB_NAME}" \
-      "POSTGRES_PASSWORD=secretref:db-password" \
-      "LIGHTRAG_API_KEY=secretref:api-key" \
-      "AZURE_OPENAI_API_KEY=secretref:aoai-key" \
-      "AZURE_OPENAI_ENDPOINT=${AOAI_ENDPOINT}" \
-      "AZURE_OPENAI_API_VERSION=2024-08-01-preview" \
-      "AZURE_OPENAI_DEPLOYMENT=gpt-4.1" \
-      "AZURE_EMBEDDING_DEPLOYMENT=text-embedding-3-large" \
-      "AZURE_EMBEDDING_API_VERSION=2023-05-15" \
+    --env-vars "${CA_ENV_VARS[@]}" \
     --output none
 
   ok "Container App created"
@@ -692,8 +749,8 @@ echo "  DB User:        $DB_USER"
 echo "  API Key:        $API_KEY"
 echo ""
 echo "  Azure OpenAI:   $AOAI_ENDPOINT"
-echo "  LLM Model:      gpt-4.1"
-echo "  Embed Model:    text-embedding-3-large"
+echo "  LLM Model:      $LLM_MODEL ($AZURE_OPENAI_DEPLOYMENT)"
+echo "  Embed Model:    $EMBEDDING_MODEL ($AZURE_EMBEDDING_DEPLOYMENT)"
 echo ""
 echo "  ACR:            $ACR_LOGIN_SERVER"
 echo "  Image:          ${ACR_LOGIN_SERVER}/${SERVICE_NAME}:latest"
