@@ -232,15 +232,33 @@ info "Creating Azure OpenAI resource..."
 if az cognitiveservices account show --name "$OPENAI_NAME" --resource-group "$RESOURCE_GROUP" &>/dev/null; then
   ok "Azure OpenAI '$OPENAI_NAME' already exists"
 else
-  az cognitiveservices account create \
+  # Try creating; if it fails because of a soft-deleted resource, purge it first
+  if ! az cognitiveservices account create \
     --name "$OPENAI_NAME" \
     --resource-group "$RESOURCE_GROUP" \
     --kind OpenAI \
     --sku S0 \
     --location "$LOCATION" \
     --yes \
-    --output none
-  ok "Azure OpenAI resource created"
+    --output none 2>/dev/null; then
+    info "Resource was soft-deleted, purging before re-creating..."
+    az cognitiveservices account purge \
+      --name "$OPENAI_NAME" \
+      --resource-group "$RESOURCE_GROUP" \
+      --location "$LOCATION" \
+      --output none
+    az cognitiveservices account create \
+      --name "$OPENAI_NAME" \
+      --resource-group "$RESOURCE_GROUP" \
+      --kind OpenAI \
+      --sku S0 \
+      --location "$LOCATION" \
+      --yes \
+      --output none
+    ok "Azure OpenAI resource created (after purging soft-deleted resource)"
+  else
+    ok "Azure OpenAI resource created"
+  fi
 fi
 
 AOAI_ENDPOINT=$(az cognitiveservices account show \
@@ -305,12 +323,22 @@ info "Creating Key Vault..."
 if az keyvault show --name "$KV_NAME" --resource-group "$RESOURCE_GROUP" &>/dev/null; then
   ok "Key Vault '$KV_NAME' already exists"
 else
-  az keyvault create \
+  if ! az keyvault create \
     --name "$KV_NAME" \
     --resource-group "$RESOURCE_GROUP" \
     --location "$LOCATION" \
-    --output none
-  ok "Key Vault '$KV_NAME' created"
+    --output none 2>/dev/null; then
+    info "Key Vault was soft-deleted, purging before re-creating..."
+    az keyvault purge --name "$KV_NAME" --location "$LOCATION" --output none
+    az keyvault create \
+      --name "$KV_NAME" \
+      --resource-group "$RESOURCE_GROUP" \
+      --location "$LOCATION" \
+      --output none
+    ok "Key Vault '$KV_NAME' created (after purging soft-deleted vault)"
+  else
+    ok "Key Vault '$KV_NAME' created"
+  fi
 fi
 
 KV_ID=$(az keyvault show --name "$KV_NAME" --resource-group "$RESOURCE_GROUP" \
